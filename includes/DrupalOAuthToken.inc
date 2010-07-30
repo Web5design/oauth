@@ -11,7 +11,8 @@ class DrupalOAuthToken extends OAuthToken {
   public $services = array();
   public $authorized = 0;
   public $expires = 0;
-  
+  public $in_database = FALSE;
+
   public function __construct($key, $secret, $params=array()) {
     parent::__construct($key, $secret);
     foreach($params as $key => $value) {
@@ -29,7 +30,7 @@ class DrupalOAuthToken extends OAuthToken {
    * @return void
    */
   public function write($update=FALSE) {
-    $primary = $update ? array('token_key') : array();
+    $primary = $update ? array('token_key', 'provider_token') : array();
 
     if (!$update) {
       $this->created = time();
@@ -46,6 +47,7 @@ class DrupalOAuthToken extends OAuthToken {
     }
 
     drupal_write_record('oauth_common_token', $values, $primary);
+    $this->in_database = TRUE;
   }
 
   /**
@@ -54,17 +56,22 @@ class DrupalOAuthToken extends OAuthToken {
    * @return void
    */
   public function delete() {
-    self::deleteToken($this->key);
+    self::deleteToken($this->key, $this->provider_token);
   }
 
   /**
    * Deletes the token with the key from the database
    *
+   * @param string $key
+   *  The key of the token to delete.
+   * @param bool $provider_token
+   *  Whether the token to delete is a provider token.
    * @return void
    */
-  public static function deleteToken($key) {
-    db_query("DELETE FROM {oauth_common_token} WHERE token_key='%s'", array(
-      'key' => $key,
+  public static function deleteToken($key, $provider_token=TRUE) {
+    db_query("DELETE FROM {oauth_common_token} WHERE token_key='%s' AND provider_token=%d", array(
+      ':key' => $key,
+      ':provider_token' => $provider_token,
     ));
   }
 
@@ -73,12 +80,15 @@ class DrupalOAuthToken extends OAuthToken {
    *
    * @param string $key
    *  The key of the token to get
+   * @param bool $provider_token
+   *  Whether the token to load is a provider token.
    * @return DrupalOAuthToken
    *  The loaded token object or FALSE if load failed
    */
-  public static function load($key) {
-    return self::fromResult(db_query("SELECT * FROM {oauth_common_token} WHERE token_key='%s'", array(
+  public static function load($key, $provider_token=TRUE) {
+    return self::fromResult(db_query("SELECT * FROM {oauth_common_token} WHERE token_key='%s' AND provider_token=%d", array(
       ':key' => $key,
+      ':provider_token' => $provider_token,
     )));
   }
 
@@ -93,6 +103,7 @@ class DrupalOAuthToken extends OAuthToken {
   public static function fromResult($res) {
     if ($data = db_fetch_array($res)) {
       $data['services'] = json_decode($data['services']);
+      $data['in_database'] = TRUE;
       return new DrupalOAuthToken($data['token_key'], $data['secret'], $data);
     }
     return NULL;

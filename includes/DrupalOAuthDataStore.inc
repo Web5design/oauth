@@ -5,6 +5,12 @@
 * Database abstraction class
 */
 class DrupalOAuthDataStore extends OAuthDataStore {
+  private $context;
+
+  public function __construct($context) {
+    $this->construct = $construct;
+  }
+
   /**
    * Check if consumer exists from a given consumer key.
    *
@@ -17,12 +23,12 @@ class DrupalOAuthDataStore extends OAuthDataStore {
    * @throws OAuthException
    *  An exception is thrown when the consumer cannot be found
    */
-  function lookup_consumer($consumer_key, $provider_consumer=TRUE) {
-    $consumer = DrupalOAuthConsumer::load($consumer_key);
-    if ($consumer && $consumer->provider_consumer==$provider_consumer) {
-      return $consumer;
+  public function lookup_consumer($consumer_key, $provider_consumer=TRUE) {
+    $consumer = DrupalOAuthConsumer::load($consumer_key, $provider_consumer);
+    if (!$consumer) {
+      throw new OAuthException('Consumer not found');
     }
-    throw new OAuthException('Consumer not found');
+    return $consumer;
   }
 
   /**
@@ -41,8 +47,8 @@ class DrupalOAuthDataStore extends OAuthDataStore {
    * @throws OAuthException
    *  An exception is thrown when the token cannot be found or doesn't match
    */
-  function lookup_token($consumer, $token_type, $token, $provider_token=TRUE) {
-    $token = DrupalOAuthToken::load($token);
+  public function lookup_token($consumer, $token_type, $token, $provider_token=TRUE) {
+    $token = DrupalOAuthToken::load($token, $provider_token);
     if ($token) {
       if ($token->type==$token_type
           && $token->consumer_key==$consumer->key
@@ -70,7 +76,7 @@ class DrupalOAuthDataStore extends OAuthDataStore {
    *   The existing nonce value or NULL in
    *   case it doesn't exist.
    */
-  function lookup_nonce($consumer, $token, $nonce, $timestamp) {
+  public function lookup_nonce($consumer, $token, $nonce, $timestamp) {
     $stored_nonce = db_result(db_query(
       "SELECT nonce FROM {oauth_common_nonce}
       WHERE nonce='%s' AND timestamp <= %d and token = '%s'", array(
@@ -100,11 +106,12 @@ class DrupalOAuthDataStore extends OAuthDataStore {
    * @return DrupalOAuthToken
    *  The request token
    */
-  function new_request_token($consumer) {
+  function new_request_token($consumer, $callback = null) {
     $token = new DrupalOAuthToken(user_password(32), user_password(32), array(
       'consumer_key'    => $consumer->key,
       'type'            => 'request',
       'uid'             => 0,
+      'provider_token'  => TRUE,
       'expires'         => time() + variable_get('oauth_common_request_token_lifetime', 7200),
     ));
     $token->write();
@@ -119,7 +126,7 @@ class DrupalOAuthDataStore extends OAuthDataStore {
    * @param OAuthConsumer $consumer
    *   The service consumer information.
    */
-  function new_access_token($token_old, $consumer) {
+  function new_access_token($token_old, $consumer, $verifier = null) {
     module_load_include('inc', 'oauth_common');
 
     if ($token_old && $token_old->authorized) {
@@ -127,6 +134,7 @@ class DrupalOAuthDataStore extends OAuthDataStore {
         'type'            => 'access',
         'uid'             => $token_old->uid,
         'consumer_key'    => $consumer->key,
+        'provider_token'  => TRUE,
         'services'        => $token_old->services,
         'authorized'      => 1,
       ));

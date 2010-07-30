@@ -5,29 +5,32 @@ class DrupalOAuthConsumer extends OAuthConsumer {
   public $uid = 0;
   public $provider_consumer = TRUE;
   public $name = '';
+  public $context = '';
   public $created = 0;
   public $changed = 0;
-  public $type = '';
-  public $callback_url = NULL;
+  public $callback_url = 'oob';
+  public $configuration = array();
+  public $in_database = FALSE;
 
-  function __construct($key, $secret, $callback_url=NULL, $params=array()) {
+  function __construct($key, $secret, $callback_url='oob', $provider_consumer=TRUE, $params=array()) {
     parent::__construct($key, $secret, $callback_url);
+    $this->provider_consumer = $provider_consumer;
     foreach($params as $key => $value) {
       if (isset($this->$key)) {
         $this->$key = $value;
       }
     }
   }
-  
+
   /**
    * Writes the consumer to the database
    *
-   * @param bool $update 
+   * @param bool $update
    *  Optional. Set to TRUE if the consumer exists and should be updated. Defaults to FALSE.
    * @return void
    */
   public function write($update=FALSE) {
-    $primary = $update ? array('consumer_key') : array();
+    $primary = $update ? array('consumer_key', 'provider_consumer') : array();
 
     if (!$update) {
       $this->created = time();
@@ -37,12 +40,18 @@ class DrupalOAuthConsumer extends OAuthConsumer {
     $values = get_object_vars($this);
     $values['consumer_key'] = $this->key;
 
+    if (empty($values['configuration'])) {
+      $values['configuration'] = array();
+    }
+    $values['configuration'] = serialize($values['configuration']);
+
     // Stop the created time from being modified
     if ($update) {
       unset($values['created']);
     }
 
     drupal_write_record('oauth_common_consumer', $values, $primary);
+    $this->in_database = TRUE;
   }
 
   /**
@@ -51,17 +60,25 @@ class DrupalOAuthConsumer extends OAuthConsumer {
    * @return void
    */
   public function delete() {
-    self::deleteConsumer($this->key);
+    self::deleteConsumer($this->key, $this->provider_consumer);
   }
 
   /**
-   * Deletes the consumer with the key from the database
+   * Deletes the consumer with the key from the database.
    *
+   * @param string $key
+   *  The consumer key.
+   * @param bool $provider_consumer
+   *  Optional. Whether the consumer we're about to delete is a provider or
+   *  consumer consumer. Defaults to TRUE.
    * @return void
    */
-  public static function deleteConsumer($key) {
-    db_query("DELETE FROM {oauth_common_consumer} WHERE consumer_key='%s'", array(
-      'key' => $key,
+  public static function deleteConsumer($key, $provider_consumer=TRUE) {
+    db_query("DELETE FROM {oauth_common_consumer} 
+      WHERE consumer_key='%s'
+      AND provider_consumer=%d", array(
+        ':consumer_key' => $key,
+        ':provider_consumer' => $provider_consumer,
     ));
   }
 
@@ -70,12 +87,17 @@ class DrupalOAuthConsumer extends OAuthConsumer {
    *
    * @param string $key
    *  The key of the consumer to get
+   * @param bool $provider_consumer
+   *  Optional. Whether the consumer we're about to load is a provider or
+   *  consumer consumer. Defaults to TRUE.
    * @return DrupalOAuthConsumer
    *  The loaded consumer object or FALSE if load failed
    */
-  public static function load($key) {
-    return self::fromResult(db_query("SELECT * FROM {oauth_common_consumer} WHERE consumer_key='%s'", array(
-      ':key' => $key,
+  public static function load($key, $provider_consumer=TRUE) {
+    return self::fromResult(db_query("SELECT * FROM {oauth_common_consumer} 
+      WHERE consumer_key='%s' AND provider_consumer='%d'", array(
+        ':consumer_key' => $key,
+        ':provider_consumer' => $provider_consumer,
     )));
   }
 
@@ -89,7 +111,11 @@ class DrupalOAuthConsumer extends OAuthConsumer {
    */
   public static function fromResult($res) {
     if ($data = db_fetch_array($res)) {
-      return new DrupalOAuthConsumer($data['consumer_key'], $data['secret'],  $data['callback_url'], $data);
+      if (!empty($data['configuration'])) {
+        $data['configuration'] = unserialize($data['configuration']);
+      }
+      $data['in_database'] = TRUE;
+      return new DrupalOAuthConsumer($data['consumer_key'], $data['secret'], $data['callback_url'], $data['provider_consumer'], $data);
     }
     return NULL;
   }

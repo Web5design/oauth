@@ -2,16 +2,27 @@
 // $Id$
 
 class DrupalOAuthServer extends OAuthServer {
-  function __construct() {
-    parent::__construct(new DrupalOAuthDataStore());
-    $this->add_signature_method(new OAuthSignatureMethod_HMAC_SHA1());
-    $this->add_signature_method(new OAuthSignatureMethod_PLAINTEXT());
+  public function __construct($context) {
+    parent::__construct(new DrupalOAuthDataStore($context));
 
-    $hmac = array_intersect(variable_get('oauth_common_hmac_supported',
-        array('sha256', 'sha384', 'sha512', 'crc32')),
-      hash_algos());
-    foreach ($hmac as $algo) {
-      $this->add_signature_method(new OAuthSignatureMethod_HMAC($algo));
+    if (isset($this->context->authorization_options['signature_methods'])) {
+      $sig_methods = $this->context->authorization_options['signature_methods'];
+    }
+    else {
+      $sig_methods = array('HMAC-SHA1', 'HMAC-SHA256', 'HMAC-SHA384', 'HMAC-SHA512');
+    }
+
+    foreach ($sig_methods as $signature_method) {
+      if ($signature_method == 'PLAINTEXT') {
+        $this->add_signature_method(new OAuthSignatureMethod_PLAINTEXT());
+      }
+      else {
+        // Check if the system supports the hashing algorithm
+        $algo = explode('-', $signature_method, 2);
+        if ($algo[0] == 'HMAC' && in_array(strtolower($algo[1]), hash_algos())) {
+          $this->add_signature_method(new OAuthSignatureMethod_HMAC($algo[1]));
+        }
+      }
     }
   }
 }

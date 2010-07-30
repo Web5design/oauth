@@ -26,19 +26,40 @@ function _oauth_common_validate_request_callback($type, $unsigned=NULL) {
   exit;
 }
 
-function _oauth_common_authorized() {
+function oauth_common_page_authorized() {
+  // If we have a outh_token we're acting as a consumer and just got authorized
+  if (!empty($_GET['oauth_token'])) {
+    $request_token = DrupalOAuthToken::load($_GET['oauth_token'], FALSE);
+    if ($request_token) {
+      $consumer_token = DrupalOAuthConsumer::load($request_token->consumer_key, FALSE);
+      $client = new DrupalOAuthClient($consumer_token, $request_token);
+
+      $verifier = isset($_GET['oauth_verifier']) ? $_GET['oauth_verifier'] : NULL;
+
+      $access_token = $client->getAccessToken(NULL, array('verifier' => $verifier));
+      if ($access_token) {
+        // We recieved an old token - don't update
+        if (!$access_token->in_database) {
+          $access_token->write();
+        }
+        $request_token->delete();
+        module_invoke_all('oauth_common_authorized', $consumer_token, $access_token, $request_token);
+      }
+    }
+  }
   return t('The application has been authorized');
 }
 
 /**
  * Form for granting access to the consumer
  */
-function _oauth_common_authorize() {
+function oauth_common_form_authorize() {
   module_load_include('inc', 'oauth_common');
   $req = DrupalOAuthRequest::from_request();
+  $context = oauth_common_context_from_request($req);
   $token = $req->get_parameter('oauth_token');
   $callback = $req->get_parameter('oauth_callback');
-  $token = DrupalOAuthToken::load($token);
+  $token = DrupalOAuthToken::load($token, TRUE);
 
   // Check that we have a valid token
   if (!$token) {
@@ -46,7 +67,7 @@ function _oauth_common_authorize() {
     return;
   }
 
-  $consumer = DrupalOAuthConsumer::load($token->consumer_key);
+  $consumer = DrupalOAuthConsumer::load($token->consumer_key, TRUE);
 
   // Redirect to the right form, or present an error.
   global $user;
@@ -58,14 +79,38 @@ function _oauth_common_authorize() {
       header('Location: ' . drupal_substr($_SERVER['REQUEST_URI'], 1), TRUE, 302);
     }
 
-    if (!user_access('oauth authorize consumers')) {
+    if (!(user_access('oauth authorize any consumers') || user_access('oauth authorize consumers in ' . $consumer->context))) {
       drupal_set_message(t('You are not authorized to allow external services access to this system.'), 'error');
       return drupal_access_denied();
     }
 
-    drupal_set_title(t('Authorize !name', array(
-      '!name' => $consumer->name,
-    )));
+    if (!empty($context->authorization_options['automatic_authorization']) && $context->authorization_options['automatic_authorization'] && !empty($consumer->callback_url)) {
+      // Authorize the request token
+      $token->uid = $user->uid;
+      $token->authorized = 1;
+      $token->services = $context->authorization_options['default_authorization_levels'];
+      $token->write(TRUE);
+
+      // Pick the callback url apart and add the token parameter
+      $callback = parse_url($consumer->callback_url);
+      $query = array();
+      parse_str($callback['query'], $query);
+      $query['oauth_token'] = $token->key;
+      $callback['query'] = http_build_query($query, 'idx_', '&');
+
+      // Return to the consumer site
+      header('Location: ' . _oauth_common_glue_url($callback), TRUE, 302);
+      exit;
+    }
+
+    $tvars = array(
+      '@user' => $user->name,
+      '@appname' => $consumer->name,
+      '@sitename' => variable_get('site_name', ''),
+    );
+
+    $title = !empty($context->title) ? $context->title : 'Authorize @appname';
+    drupal_set_title(t($title, $tvars));
 
     $form = array();
     $form['oauth_parameters'] = array(
@@ -73,59 +118,77 @@ function _oauth_common_authorize() {
       '#value'  => serialize($req->get_parameters()),
     );
 
-    $msgargs = array(
-      '!appname' => $consumer->name,
-      '!sitename' => variable_get('site_name', ''),
+    $form['oauth_consumer'] = array(
+      '#type'   => 'value',
+      '#value'  => $consumer->key,
     );
 
+    $message = !empty($context->authorization_options['message']) ? $context->authorization_options['message'] :
+      'The application @appname wants to access @sitename on your behalf, check the permissions that you would like the application to have.';
     $form['message'] = array(
       '#type' => 'item',
-      '#value' => t('The application !appname wants to access !sitename on your behalf, check the permissions that you would like the application to have.', $msgargs),
+      '#value' => t($message, $tvars),
     );
 
+    $message = !empty($context->authorization_options['warning']) ? $context->authorization_options['warning'] :
+      'If you don\'t know what @appname is, or don\'t want to give it access to your content, just click here and we\'ll take you away from this page without granting @appname any access to @sitename.';
     $form['warning'] = array(
       '#type' => 'item',
-      '#value' => l(t('If you don\'t know what !appname is, or don\'t want to give it access to your content, just click here and we\'ll take you away from this page without granting !appname any access to !sitename.', $msgargs), 'oauth/authorization/deny/' . $token->key),
+      '#value' => l(t($message, $tvars), 'oauth/authorization/deny/' . $token->key),
       '#attributes' => array(
         'class' => 'abort-authorization',
       ),
     );
 
-    $form['authorization'] = array(
-      '#type' => 'fieldset',
-      '#title' => t('Permissions'),
-      '#options' => $auth_levels,
-      'full_access' => array(
-        '#type' => 'checkbox',
-        '#title' => t('Full access'),
-        '#description' => t('This will give !appname the same permissions that you normally have and will allow it to access the full range of services that !sitename provides.', $msgargs),
-      ),
-    );
-
-    $auth_levels = oauth_common_authorization_levels();
-    $form['authorization']['levels'] = array(
-      '#tree' => TRUE,
-    );
-    foreach ($auth_levels as $name => $level) {
-      $auth_opt = array(
-        '#type' => 'checkbox',
-        '#title' => t($level->title, $msgargs),
-        '#description' => t($level->description, $msgargs),
+    $disable_selection = !empty($context->authorization_options['disable_auth_level_selection']) && !empty($context->authorization_options['default_authorization_levels']) && $context->authorization_options['disable_auth_level_selection'];
+    if (!$disable_selection) {
+      $authorization_title = !empty($context->authorization_options['authorization_title']) ? $context->authorization_options['authorization_title'] :
+        'Permissions';
+      $form['authorization'] = array(
+        '#type' => 'fieldset',
+        '#title' => t($authorization_title, $tvars),
+        '#options' => $auth_levels,
       );
-      $form['authorization']['levels'][$name] = $auth_opt;
+
+      $form['authorization']['levels'] = array(
+        '#tree' => TRUE,
+      );
+      foreach ($context->authorization_levels as $name => $level) {
+        $auth_opt = array(
+          '#type' => 'checkbox',
+          '#title' => t($level['title'], $tvars),
+          '#description' => t($level['description'], $tvars),
+        );
+        $form['authorization']['levels'][$name] = $auth_opt;
+      }
+    }
+    else {
+      $form['authorization']['levels'] = array(
+        '#tree' => TRUE,
+      );
+      foreach ($context->authorization_options['default_authorization_levels'] as $level) {
+        $form['authorization']['levels'][$level] = array(
+          '#type' => 'value',
+          '#value' => $level,
+        );
+      }
     }
 
+    $deny_title = !empty($context->authorization_options['deny_access_title']) ? $context->authorization_options['deny_access_title'] :
+      'Deny access';
     $form['deny'] = array(
       '#type'   => 'item',
-      '#value'  => l(t('Deny access'), 'oauth/authorization/deny/' . $token->key),
+      '#value'  => l(t($deny_title), 'oauth/authorization/deny/' . $token->key),
       '#attributes' => array(
         'class' => 'deny-access',
       ),
     );
 
+    $grant_title = !empty($context->authorization_options['grant_access_title']) ? $context->authorization_options['grant_access_title'] :
+      'Grant access';
     $form['confirm'] = array(
       '#type'   => 'submit',
-      '#value'  => t('Grant access'),
+      '#value'  => t($grant_title),
     );
 
     return $form;
@@ -136,51 +199,55 @@ function _oauth_common_authorize() {
     drupal_goto('user/login', array(
       'destination' => url('oauth/authorize', array(
         'query' => $query,
-        'absolute' => TRUE,
       )),
     ));
   }
 }
 
-function _oauth_common_authorize_validate($form, &$form_state) {
+function oauth_common_form_authorize_validate($form, &$form_state) {
   $values = $form_state['values'];
   $got_permission = FALSE;
 
-  $auth_levels = oauth_common_authorization_levels();
-  foreach ($auth_levels as $name => $level) {
-    if ($values['levels'][$name]) {
-      $got_permission = TRUE;
-      break;
+  $consumer = DrupalOAuthConsumer::load($values['oauth_consumer'], TRUE);
+  $context = oauth_common_context_load($consumer->context);
+
+  if (!$context->authorization_options['disable_auth_level_selection']) {
+    foreach ($context->authorization_levels as $name => $level) {
+      if ($values['levels'][$name]) {
+        $got_permission = TRUE;
+        break;
+      }
     }
-  }
 
-  $got_permission = $got_permission || $values['full_access'];
+    $got_permission = $got_permission;
 
-  if (!$got_permission) {
-    form_set_error('confirm', t('You haven\'t given the application access to anything. Click on "Deny access" or just close this window if you don\'t want to authorize it.'));
+    if (!$got_permission) {
+      form_set_error('confirm', t('You haven\'t given the application access to anything. Click on "Deny access" or just close this window if you don\'t want to authorize it.'));
+    }
   }
 }
 
-function _oauth_common_authorize_submit(&$form, &$form_state) {
+function oauth_common_form_authorize_submit(&$form, &$form_state) {
+  global $user;
   $values = $form_state['values'];
   // Unserialize the stored oauth parameters
   $parameters = unserialize($values['oauth_parameters']);
 
   // Save the list of all services that the user allowed the
   // consumer to do
-  global $user;
-  $token = DrupalOAuthToken::load($parameters['oauth_token']);
+  $token = DrupalOAuthToken::load($parameters['oauth_token'], TRUE);
   $token->uid = $user->uid;
   $token->authorized = 1;
   $token->services = array();
+  $consumer = DrupalOAuthConsumer::load($token->consumer_key, TRUE);
+  $context = oauth_common_context_load($consumer->context);
 
   // Add services
-  if ($values['full_access']) {
+  if ($values['full_access']) { // TODO: Full access should be a configurable auth level
     $token->services[] = '*';
   }
   else {
-    $auth_levels = oauth_common_authorization_levels();
-    foreach ($auth_levels as $name => $level) {
+    foreach ($context->authorization_levels as $name => $level) {
       if ($values['levels'][$name]) {
         $token->services[] = $name;
       }
@@ -189,11 +256,11 @@ function _oauth_common_authorize_submit(&$form, &$form_state) {
 
   $token->write(TRUE);
 
-  $got_permission = $got_permission || $values['full_access'];
+  $got_permission = $got_permission || $values['full_access']; // TODO: Full access should be a configurable auth level
 
-  if (isset($parameters['oauth_callback'])) {
+  if (!empty($consumer->callback_url)) {
     // Pick the callback url apart and add the token parameter
-    $callback = parse_url($parameters['oauth_callback']);
+    $callback = parse_url($consumer->callback_url);
     $query = array();
     parse_str($callback['query'], $query);
     $query['oauth_token'] = $token->key;
@@ -228,10 +295,10 @@ function _oauth_common_glue_url($parsed) {
 /**
  * Generate a request token from the request.
  */
-function _oauth_common_request_token() {
+function oauth_common_callback_request_token() {
   try {
-    $server = new DrupalOAuthServer();
     $req = DrupalOAuthRequest::from_request();
+    $server = new DrupalOAuthServer(oauth_common_context_from_request($req));
     print $server->fetch_request_token($req);
   }
   catch (OAuthException $e) {
@@ -243,341 +310,33 @@ function _oauth_common_request_token() {
 /**
  * Get a access token for the request
  */
-function _oauth_common_access_token() {
+function oauth_common_callback_access_token() {
   try {
-    $server = new DrupalOAuthServer();
     $req = DrupalOAuthRequest::from_request();
+    $context = oauth_common_context_from_request($req);
+    $server = new DrupalOAuthServer($context);
     $access_token = $server->fetch_access_token($req);
 
-    // Store the expiry time if specified by the client
+    // Set the expiry time based on context settings or get parameter
+    $expires = !empty($context->authorization_options['access_token_lifetime']) ? time() + $context->authorization_options['access_token_lifetime'] : 0;
     if ($_GET['expires'] && intval($_GET['expires'])) {
-      $access_token->expires = intval($_GET['expires']);
+      $hint = intval($_GET['expires']);
+      // Only accept more restrictive expiry times
+      if ($expires == 0 || $hint < $expires) {
+        $expires = $hint;
+      }
+    }
+
+    // Store the expiry time if the access token should expire
+    if ($expires) {
+      $access_token->expires = $expires;
       $access_token->write(TRUE);
     }
+
     print $access_token;
   }
   catch (OAuthException $e) {
     drupal_set_header('HTTP/1.0 401 Unauthorized: ' . $e->getMessage());
     drupal_set_header(sprintf('WWW-Authenticate: OAuth realm="%s"', url('', array('absolute'=>TRUE))));
   }
-}
-
-function _oauth_common_user_applications($form_state, $account) {
-  drupal_set_title(check_plain($account->name));
-  module_load_include('inc', 'oauth_common');
-
-  $form = array(
-    'uid' => array(
-      '#type' => 'value',
-      '#value' => $account->uid,
-    ),
-  );
-  $ci = oauth_common_user_consumers($account->uid);
-  if (!empty($ci) || user_access('oauth register consumers')) {
-    $apps = array(
-      '#type' => 'fieldset',
-      '#title' => t('Applications'),
-    );
-
-    if (!empty($ci)) {
-      foreach ($ci as $consumer) {
-        $apps[$consumer->key] = array(
-          '#prefix' => '<div class="consumer-application"><h3>' . $consumer->name . '</h3>',
-          '#suffix' => '</div>',
-          'type' => array(
-            '#type' => 'item',
-            '#title' => t('Type'),
-            '#value' => $consumer->type,
-          ),
-          'consumer_key' => array(
-            '#type' => 'item',
-            '#title' => t('Consumer key'),
-            '#value' => $consumer->key,
-          ),
-          'secret' => array(
-            '#type' => 'fieldset',
-            '#collapsible' => TRUE,
-            '#collapsed' => TRUE,
-            '#title' => t('Consumer secret'),
-            'consumer_secret' => array(
-              '#type' => 'item',
-              '#value' => $consumer->secret,
-            ),
-          ),
-        );
-      }
-    }
-
-    if (user_access('oauth register consumers')) {
-      $apps['create_consumer'] = array(
-        '#type' => 'submit',
-        '#value' => 'Add application',
-      );
-    }
-
-    $form['applications'] = $apps;
-  }
-
-  if (user_access('oauth authorize consumers', $account)) {
-    $auth = array(
-      '#type' => 'fieldset',
-      '#title' => t('Authorizations'),
-    );
-
-    $tokens = oauth_common_user_access_tokens($account->uid);
-    $consumers = array();
-    foreach ($tokens as $token) {
-      if (!isset($consumers[$token->consumer_key])) {
-        $consumers[$token->consumer_key] = DrupalOAuthConsumer::load($token->consumer_key);
-      }
-      $consumer = $consumers[$token->consumer_key];
-
-      $auth[$token->key] = array(
-        '#prefix' => '<div class="consumer-authorization">',
-        '#suffix' => '</div>',
-        'consumer_name' => array(
-          '#type' => 'item',
-          '#title' => t('Application'),
-          '#value' => $consumer->name,
-        ),
-        'access_key' => array(
-          '#type' => 'item',
-          '#title' => t('Token key'),
-          '#value' => $token->key,
-        ),
-        'remove_link' => array(
-          '#type' => 'item',
-          '#value' => l('Edit authorization', 'user/' . $account->uid .
-            '/applications/authorization/' . $token->key),
-        ),
-      );
-    }
-
-    $form['authorizations'] = $auth;
-  }
-
-  return $form;
-}
-
-function _oauth_common_user_applications_submit($form, $form_state) {
-  // Send the user to the application creation form
-  if ($form_state['clicked_button']['#id']=='edit-create-consumer') {
-    drupal_goto(sprintf('user/%d/applications/add', $form_state['values']['uid']));
-  }
-}
-
-function _oauth_common_user_authorization_edit($form_state, $user, $key) {
-  $form = array();
-
-  $token = DrupalOAuthToken::load($key);
-  $consumer = DrupalOAuthConsumer::load($token->consumer_key);
-
-  drupal_set_title(t('Authorization for !app', array('!app' => $consumer->name)));
-
-  $form['user'] = array(
-    '#type' => 'value',
-    '#value' => $user->uid,
-  );
-
-  $form['key'] = array(
-    '#type' => 'value',
-    '#value' => $token->key,
-  );
-
-  $form['authorized'] = array(
-    '#type' => 'checkbox',
-    '#title' => t('Authorized'),
-    '#default_value' => $token->authorized,
-  );
-
-  $form['created'] = array(
-    '#type' => 'item',
-    '#title' => t('Created'),
-    '#value' => format_date($token->created),
-  );
-
-  $form['changed'] = array(
-    '#type' => 'item',
-    '#title' => t('Changed'),
-    '#value' => format_date($token->changed),
-  );
-
-  $form['key_item'] = array(
-    '#type' => 'item',
-    '#title' => t('Key'),
-    '#value' => $token->key,
-  );
-
-  $form['allowed'] = array(
-    '#type' => 'fieldset',
-    '#title' => t('Permissions'),
-  );
-
-  oauth_common_permissions_form($form['allowed'], $consumer, $token->services);
-
-  $form['delete'] = array(
-    '#type' => 'item',
-    '#value' => l(t('Delete'), sprintf('user/%d/applications/authorization/%s/delete', $user->uid, $token->key)),
-  );
-
-  $form['submit'] = array(
-    '#type' => 'submit',
-    '#value' => t('Save'),
-  );
-
-  return $form;
-}
-
-function _oauth_common_user_authorization_edit_submit($form, $form_state) {
-  $values = $form_state['values'];
-
-  // Collect the authorization levels
-  $services = array();
-  foreach ($values['levels'] as $level => $allowed) {
-    if ($allowed) {
-      $services[] = $level;
-    }
-  }
-
-  $token = DrupalOAuthToken::load($values['key']);
-  $consumer = DrupalOAuthConsumer::load($token->consumer_key);
-
-  $token->services = $services;
-  $token->authorized = $values['authorized'];
-  $token->write(TRUE);
-
-  drupal_set_message(t('The !consumer token !token was updated.', array(
-    '!consumer' => $consumer->name,
-    '!token' => $token->key)));
-  drupal_goto(sprintf('user/%d/applications', $form_state['values']['user']));
-}
-
-function _oauth_common_user_authorization_delete($form_state, $user, $key) {
-  $token = DrupalOAuthToken::load($key);
-  $consumer = DrupalOAuthConsumer::load($token->consumer_key);
-
-  drupal_set_title(t('Deleting authorization for "!title"', array(
-    '!title' => $consumer->name,
-  )));
-
-  $form = array(
-    'authorization' => array(
-      '#type' => 'value',
-      '#value' => $authorization,
-    ),
-  );
-
-  $form['user'] = array(
-    '#type' => 'value',
-    '#value' => $user->uid,
-  );
-
-  $form['key'] = array(
-    '#type' => 'value',
-    '#value' => $token->key,
-  );
-
-  $form['description'] = array(
-    '#type' => 'item',
-    '#value' => t('Are you sure that you want to delete the authorization for !name?', array(
-      '!name' => $consumer->name,
-    )),
-  );
-
-  $form['cancel'] = array(
-    '#type' => 'item',
-    '#value' => l(t('Cancel'), sprintf('user/%d/applications/authorization/%s', $user->uid, $token->key)),
-  );
-
-  $form['submit'] = array(
-    '#type' => 'submit',
-    '#value' => t('Delete'),
-  );
-
-  return $form;
-}
-
-function _oauth_common_user_authorization_delete_submit($form, $form_state) {
-  $token = DrupalOAuthToken::load($form_state['values']['key']);
-  $consumer = DrupalOAuthConsumer::load($token->consumer_key);
-  $token->delete();
-  drupal_set_message(t('The !consumer token !token was deleted.', array(
-    '!consumer' => $consumer->name,
-    '!token' => $token->key)));
-  drupal_goto(sprintf('user/%d/applications', $form_state['values']['user']));
-}
-
-function oauth_common_permissions_form(&$form, $consumer, $default_services=array('*')) {
-  $msgargs = array(
-    '!appname' => $consumer->name,
-    '!sitename' => variable_get('site_name', ''),
-  );
-
-  $auth_levels = array_merge(
-    array('*' => (object)array(
-      'title' => t('Full access'),
-      'description' => t('This will give !appname the same permissions that you normally have and will allow it to access the full range of services that !sitename provides.', $msgargs),
-    )), oauth_common_authorization_levels());
-  $form['authorization']['levels'] = array(
-    '#tree' => TRUE,
-  );
-
-  foreach ($auth_levels as $name => $level) {
-    $auth_opt = array(
-      '#type' => 'checkbox',
-      '#title' => t($level->title, $msgargs),
-      '#description' => t($level->description, $msgargs),
-      '#default_value' => in_array($name, $default_services),
-    );
-    $form['authorization']['levels'][$name] = $auth_opt;
-  }
-}
-
-function _oauth_common_user_applications_add($form_state, $account) {
-  $form = array();
-
-  $form = array(
-    'uid' => array(
-      '#type' => 'value',
-      '#value' => $account->uid,
-    ),
-  );
-
-  $form['name'] = array(
-    '#type' => 'textfield',
-    '#title' => t('Application name'),
-    '#required' => TRUE,
-  );
-
-  $form['callback_url'] = array(
-    '#type' => 'textfield',
-    '#title' => t('Callback url'),
-    '#required' => FALSE,
-  );
-
-  $form['type'] = array(
-    '#type' => 'select',
-    '#title' => t('Application type'),
-    '#options' => array(
-      'community' => t('Community'),
-      'commercial' => t('Commercial'),
-      'development' => t('Development'),
-    ),
-  );
-
-  $form['submit'] = array(
-    '#type' => 'submit',
-    '#value' => t('Create'),
-  );
-
-  return $form;
-}
-
-function _oauth_common_user_applications_add_submit($form, $form_state) {
-  $v = $form_state['values'];
-  $consumer = new DrupalOAuthConsumer(user_password(32), user_password(32), $v['callback_url'], $v);
-  $consumer->write();
-
-  drupal_set_message(t('Added the application !name', array('!name' => $v['name'])));
-  drupal_goto(sprintf('user/%d/applications', $v['uid']));
 }

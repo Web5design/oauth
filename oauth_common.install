@@ -3,35 +3,71 @@
 
 function oauth_common_install() {
   drupal_install_schema('oauth_common');
-
-  // Create default authorization levels
-  $insert = "INSERT INTO {oauth_authorization_levels}(name, title, description) VALUES('%s','%s', '%s')";
-  db_query($insert, array(':name' => 'read',    ':title' => 'Read access',
-    ':description' => 'This will allow !appname to fetch content that you have access to on !sitename.'));
-  db_query($insert, array(':name' => 'update',  ':title' => 'Update access',
-    ':description' => 'This will allow !appname to update content that you have permissions to edit.'));
-  db_query($insert, array(':name' => 'create',  ':title' => 'Create access',
-    ':description' => 'This will allow !appname to create new content on !sitename.'));
-  db_query($insert, array(':name' => 'delete',  ':title' => 'Delete access',
-    ':description' => 'This will allow !appname to delete content from !sitename.'));
 }
-
 function oauth_common_uninstall() {
   drupal_uninstall_schema('oauth_common');
 }
 
 function oauth_common_schema() {
-  module_load_include('6001.inc', 'oauth_common', 'updates/update');
   $schema = array();
 
-  $schema['oauth_authorization_levels'] = _oauth_common_oauth_authorization_levels_6001();
+  $schema['oauth_common_context'] = array(
+    'description' => 'Stores contexts for OAuth common',
+    'export' => array(
+      'identifier'      => 'context',
+      'export callback' => 'oauth_common_context_export',
+      'list callback'   => 'oauth_common_context_list',
+      'key'             => 'name',
+    ),
+    'fields' => array(
+      'cid' => array(
+        'type'        => 'serial',
+        'description' => 'Primary ID field for the table. Not used for anything except internal lookups.',
+        'not null'    => TRUE,
+        'no export'   => TRUE,
+      ),
+      'name' => array(
+        'description' => 'The computer-readable name of the context.',
+        'type'        => 'varchar',
+        'length'      => 32,
+        'not null'    => TRUE,
+      ),
+      'title' => array(
+        'description' => 'The localizable title of the authorization context.',
+        'type'        => 'varchar',
+        'length'      => 100,
+        'not null'    => TRUE,
+      ),
+      'authorization_options' => array(
+        'description'    => 'Authorization options.',
+        'type'           => 'text',
+        'size'           => 'big',
+        'not null'       => TRUE,
+        'serialize'      => TRUE,
+        'object default' => array(),
+      ),
+      'authorization_levels' => array(
+        'description'    => 'Authorization levels for the context.',
+        'type'           => 'text',
+        'size'           => 'big',
+        'not null'       => TRUE,
+        'serialize'      => TRUE,
+        'object default' => array(),
+      ),
+    ),
+    'primary key' => array('cid'),
+    'unique keys' => array(
+      'context' => array('name'),
+    ),
+  );
+
   $schema['oauth_common_consumer'] = array(
     'description' => t('Information that allows external applications to access services.'),
     'fields' => array(
       'consumer_key' => array(
         'description' => t('Consumer key.'),
         'type'        => 'varchar',
-        'length'      => 32,
+        'length'      => 255,
         'not null'    => TRUE,
       ),
       'provider_consumer' => array(
@@ -45,7 +81,7 @@ function oauth_common_schema() {
       'secret' => array(
         'description' => t('Consumer secret.'),
         'type'        => 'varchar',
-        'length'      => 32,
+        'length'      => 255,
         'not null'    => TRUE,
       ),
       'created' => array(
@@ -72,11 +108,12 @@ function oauth_common_schema() {
         'length'      => 128,
         'not null'    => TRUE,
       ),
-      'type' => array(
-        'description' => t('The application type.'),
+      'context' => array(
+        'description' => t('The application context.'),
         'type'        => 'varchar',
         'length'      => 32,
         'not null'    => TRUE,
+        'default'     => '',
       ),
       'callback_url' => array(
         'description' => t('Callback url.'),
@@ -84,8 +121,16 @@ function oauth_common_schema() {
         'length'      => 255,
         'not null'    => TRUE,
       ),
+      'configuration' => array(
+        'description' => t('Consumer configuration'),
+        'type'        => 'text',
+        'serialized'  => TRUE,
+        'size'        => 'big',
+        'not null'    => TRUE,
+        'object default' => array(),
+      ),
     ),
-    'primary key' => array('consumer_key'),
+    'primary key' => array('consumer_key', 'provider_consumer'),
     'index' => array(
       'user' => array('uid'),
     ),
@@ -96,7 +141,7 @@ function oauth_common_schema() {
       'token_key' => array(
         'description' => t('Token key.'),
         'type'        => 'varchar',
-        'length'      => 32,
+        'length'      => 255,
         'not null'    => TRUE,
       ),
       'provider_token' => array(
@@ -110,7 +155,7 @@ function oauth_common_schema() {
       'secret' => array(
         'description' => t('Token secret.'),
         'type'        => 'varchar',
-        'length'      => 32,
+        'length'      => 255,
         'not null'    => TRUE,
       ),
       'created' => array(
@@ -147,7 +192,7 @@ function oauth_common_schema() {
       'consumer_key' => array(
         'description' => t('Consumer key from {oauth_common_consumer}.consumer_key.'),
         'type'        => 'varchar',
-        'length'      => 32,
+        'length'      => 255,
         'not null'    => TRUE,
       ),
       'services' => array(
@@ -162,45 +207,15 @@ function oauth_common_schema() {
         'default'     => 0,
       ),
     ),
-   'primary key' => array('token_key'),
+    //TODO: The OAuth standard doesn't say that a token has to be unique - especially not across
+    //      different providers and consumers
+   'primary key' => array('token_key', 'provider_token'),
    'indexes' => array(
-      'token_key_type' => array('token_key', 'type'),
+      'token_key_type' => array('token_key', 'provider_token', 'type'),
+      'consumer_key' => array('consumer_key', 'provider_token'),
     ),
   );
-  $schema['oauth_common_consumer_token'] = array(
-    'description' => t('Tokens stored on behalf of consumers for request and services accesses.'),
-    'fields' => array(
-      'token_key' => array(
-        'description' => t('Token key.'),
-        'type'        => 'varchar',
-        'length'      => 32,
-        'not null'    => TRUE
-      ),
-      'secret' => array(
-        'description' => t('Token secret.'),
-        'type'        => 'varchar',
-        'length'      => 32,
-        'not null'    => TRUE
-      ),
-      'type' => array(
-        'description' => t('Type of the token: request, access or consumer.'),
-        'type'        => 'varchar',
-        'length'      => 8,
-        'not null'    => TRUE
-      ),
-      'uid' => array(
-        'description' => t('The user that\'s associated with the token, if any.'),
-        'type'        => 'int',
-        'unsigned'    => TRUE,
-        'not null'    => TRUE,
-        'default'     => 0,
-      ),
-    ),
-   'primary key' => array('token_key'),
-   'indexes' => array(
-      'token_key_type' => array('token_key', 'type'),
-    ),
-  );
+
   $schema['oauth_common_nonce'] = array(
     'description' => t('Stores timestamp against nonce for repeat attacks.'),
     'fields' => array(
@@ -260,3 +275,37 @@ function oauth_common_update_6003() {
   return _oauth_common_update_6003();
 }
 
+/**
+ * This update adds the concept of contexts for consumers and authorization levels.
+ * Also adding a couple of indexes that make sense when oauth_common is
+ * acting as a consumer of other services.
+ */
+function oauth_common_update_6100() {
+  module_load_include('6100.inc', 'oauth_common', 'updates/update');
+  return _oauth_common_update_6100();
+}
+
+/**
+ * This update turns the contexts into ctools-manageable entities and migrates
+ * the authorization levels into the new contexts table.
+ */
+function oauth_common_update_6200() {
+  module_load_include('6200.inc', 'oauth_common', 'updates/update');
+  return _oauth_common_update_6200();
+}
+
+/**
+ * This update unifies the handling of provider and consumer consumer entries.
+ */
+function oauth_common_update_6201() {
+  module_load_include('6201.inc', 'oauth_common', 'updates/update');
+  return _oauth_common_update_6201();
+}
+
+/**
+ * This update allows for longer consumer secrets.
+ */
+function oauth_common_update_6202() {
+  module_load_include('6202.inc', 'oauth_common', 'updates/update');
+  return _oauth_common_update_6202();
+}
